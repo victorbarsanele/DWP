@@ -9,6 +9,7 @@ if (action !== "up" && action !== "down") {
   throw new Error("Usage: bun run migrate:up|migrate:down");
 }
 if (useTestDatabase) {
+  process.env.NODE_ENV = "test";
   process.env.TEST_DATABASE_URL ??=
     "postgresql://spike:spike@127.0.0.1:55432/spike_test";
 }

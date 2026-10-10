@@ -4,9 +4,9 @@ import { entities } from "./schemas/schemas";
 
 export function mikroOrmOptions() {
   const config = loadConfig();
-  const clientUrl =
-    process.env.TEST_DATABASE_URL
-    ?? (config.nodeEnv === "test" ? config.databaseUrl : undefined);
+  const clientUrl = config.nodeEnv === "test"
+    ? process.env.TEST_DATABASE_URL ?? config.databaseUrl
+    : config.databaseUrl;
   return {
     entities,
     driver: PostgreSqlDriver,
