@@ -3,6 +3,7 @@ import { expect } from "bun:test";
 
 export async function assertWalletInvariant(
   walletId: string,
+  initialBalance = "0.00",
 ): Promise<void> {
   const client = new pg.Client({
     connectionString: process.env.TEST_DATABASE_URL
@@ -36,11 +37,11 @@ export async function assertWalletInvariant(
   expect(new Set(transactionIds).size).toBe(transactionIds.length);
 
   if (ledgerResult!.rows.length === 0) {
-    expect(walletResult.rows[0]?.balance_amount).toBe("0.00");
+    expect(walletResult.rows[0]?.balance_amount).toBe(initialBalance);
     return;
   }
 
-  let expectedBefore = "0.00";
+  let expectedBefore = initialBalance;
   const remaining = [...ledgerResult!.rows];
   while (remaining.length > 0) {
     const index = remaining.findIndex((row) => row.balance_before === expectedBefore);

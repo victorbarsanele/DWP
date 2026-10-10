@@ -41,6 +41,6 @@ import { MikroWageringPortFactory } from "../infrastructure/persistence/mikro-or
       ) => new CreateWalletUseCase(runner, ports, clock, ids),
     },
   ],
-  exports: [ProcessWagerTransactionUseCase, CreateWalletUseCase],
+  exports: [ProcessWagerTransactionUseCase, CreateWalletUseCase, RandomIdGenerator],
 })
 export class ApplicationModule {}

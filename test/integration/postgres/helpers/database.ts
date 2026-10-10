@@ -8,6 +8,14 @@ export const pool = new pg.Pool({
   max: 10,
 });
 
+let poolClosed = false;
+process.once("beforeExit", async () => {
+  if (!poolClosed) {
+    poolClosed = true;
+    await pool.end();
+  }
+});
+
 export function id(): string {
   return crypto.randomUUID();
 }

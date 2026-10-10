@@ -20,37 +20,37 @@ export class MikroTransactionRunner implements TransactionRunnerPort {
       const fork = this.entityManager.fork({ clear: true });
       try {
         return await fork.transactional(async (transactionManager) => {
-        const transactionContext = transactionManager.getTransactionContext();
-        await transactionManager.getConnection().execute(
-          `set local lock_timeout = '${this.lockTimeoutMs}ms'`,
-          [],
-          "all",
-          transactionContext,
-        );
-        await transactionManager.getConnection().execute(
-          `set local statement_timeout = '${this.statementTimeoutMs}ms'`,
-          [],
-          "all",
-          transactionContext,
-        );
-        const sql: SqlTransaction = {
-          execute: async <R extends Record<string, unknown>>(
-            statement: string,
-            params: readonly unknown[] = [],
-          ) => {
-            const expanded: unknown[] = [];
-            const query = statement.replace(/\$(\d+)/g, (_match, index: string) => {
-              expanded.push(params[Number(index) - 1]);
-              return "?";
-            });
-            return transactionManager.getConnection().execute<R[]>(
-              query,
-              expanded,
-              "all",
-              transactionContext,
-            );
-          },
-        };
+          const transactionContext = transactionManager.getTransactionContext();
+          await transactionManager.getConnection().execute(
+            `set local lock_timeout = '${this.lockTimeoutMs}ms'`,
+            [],
+            "all",
+            transactionContext,
+          );
+          await transactionManager.getConnection().execute(
+            `set local statement_timeout = '${this.statementTimeoutMs}ms'`,
+            [],
+            "all",
+            transactionContext,
+          );
+          const sql: SqlTransaction = {
+            execute: async <R extends Record<string, unknown>>(
+              statement: string,
+              params: readonly unknown[] = [],
+            ) => {
+              const expanded: unknown[] = [];
+              const query = statement.replace(/\$(\d+)/g, (_match, index: string) => {
+                expanded.push(params[Number(index) - 1]);
+                return "?";
+              });
+              return transactionManager.getConnection().execute<R[]>(
+                query,
+                expanded,
+                "all",
+                transactionContext,
+              );
+            },
+          };
           return work(sql);
         });
       } catch (error) {

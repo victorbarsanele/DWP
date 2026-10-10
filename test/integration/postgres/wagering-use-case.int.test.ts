@@ -8,9 +8,10 @@ import { CreateWalletUseCase } from "../../../src/application/use-cases/create-w
 import { ProcessWagerTransactionUseCase } from "../../../src/application/use-cases/process-wager-transaction.use-case";
 import { WagerTransactionKind } from "../../../src/domain/wagering/wager-transaction";
 import { FailureCode } from "../../../src/domain/shared/failure-code";
-import { InfrastructureTransientError, SqlTransaction } from "../../../src/application/ports/transaction-runner.port";
+import { InfrastructureTransientError } from "../../../src/application/ports/transaction-runner.port";
 import { WageringPortFactory } from "../../../src/application/ports/wagering.ports";
 import { assertWalletInvariant } from "./helpers/assert-wallet-invariant";
+import { insertWallet } from "./helpers/database";
 function id(): string {
   return crypto.randomUUID();
 }
@@ -42,13 +43,6 @@ describe("wagering application with PostgreSQL", () => {
     max: 10,
     connectionTimeoutMillis: 5000,
   });
-  /*
-  const pool = new pg.Pool({
-    connectionString: process.env.TEST_DATABASE_URL ?? "postgresql://spike:spike@127.0.0.1:55432/spike_test",
-    max: 1,
-  });
-  */
-
   beforeAll(async () => {
     orm = await MikroORM.init(mikroOrmOptions());
   });
@@ -408,9 +402,14 @@ describe("wagering application with PostgreSQL", () => {
       kind: WagerTransactionKind.Bet,
       money: { amount: "10.00", currency: "BRL" },
     };
+    let retryCount = 0;
     const results = await Promise.all(
-      Array.from({ length: 50 }, () => process.execute(input)),
+      Array.from({ length: 50 }, () => process.execute(input).catch((error: unknown) => {
+        if (error instanceof InfrastructureTransientError) retryCount += 1;
+        throw error;
+      })),
     );
+    expect(retryCount).toBe(0);
     expect(results.filter((result) => result.status === "PROCESSED")).toHaveLength(50);
     expect(results.filter((result) => result.idempotentReplay)).toHaveLength(49);
     const rows = (await inspectionPool.query<{ balance_amount: string; ledger_count: string }>(
@@ -475,25 +474,16 @@ describe("wagering application with PostgreSQL", () => {
       roundId: `round-${id()}`, gameId: `game-${id()}`,
       kind: WagerTransactionKind.Bet, money: { amount: "10.00", currency: "BRL" },
     }));
-    const submitWithRedelivery = async (input: (typeof inputs)[number]) => {
-      for (let attempt = 1; attempt <= 20; attempt += 1) {
-        try {
-          return await process.execute(input);
-        } catch (error) {
-          if (!(error instanceof InfrastructureTransientError) || attempt === 20) {
-            throw error;
-          }
-          await new Promise((resolve) => setTimeout(resolve, attempt));
-        }
+    let retryCount = 0;
+    const results = await Promise.all(inputs.map(async (input) => {
+      try {
+        return await process.execute(input);
+      } catch (error) {
+        if (error instanceof InfrastructureTransientError) retryCount += 1;
+        throw error;
       }
-      throw new Error("unreachable");
-    };
-    const results = [];
-    for (let offset = 0; offset < inputs.length; offset += 2) {
-      results.push(...await Promise.all(
-        inputs.slice(offset, offset + 2).map(submitWithRedelivery),
-      ));
-    }
+    }));
+    expect(retryCount).toBe(0);
     expect(results.filter((result) => result.status === "PROCESSED")).toHaveLength(50);
     expect(results.filter((result) => result.status === "REJECTED")).toHaveLength(50);
     const rows = (await inspectionPool.query<{ balance_amount: string; ledger_count: string }>(
@@ -590,71 +580,55 @@ describe("wagering application with PostgreSQL", () => {
     })).rejects.toThrow(FailureCode.WalletAlreadyExists);
   });
 
-  test("rolls back wager, ledger and outbox on transient outbox failure", async () => {
+  test("rolls back completely with production runner for permanent and transient outbox failures", async () => {
     const clock = new TestClock();
     const ids = new TestIds();
-    const runner = new MikroTransactionRunner(orm.em);
     const factory = new MikroWageringPortFactory(orm.em);
-    const walletId = trackWallet(id());
-    const playerId = id();
-    await new CreateWalletUseCase(runner, factory, clock, ids).execute({
-      id: walletId, playerId, initialBalance: { amount: "100.00", currency: "BRL" },
-    });
-    const failingFactory: WageringPortFactory = {
-      forTransaction: (transaction) => {
-        const ports = factory.forTransaction(transaction);
-        return {
-          ...ports,
-          outbox: {
-            append: async (_event) => {
-              throw new InfrastructureTransientError("outbox unavailable");
+    const runFailure = async (error: Error) => {
+      const walletId = id();
+      const { playerId } = await insertWallet(walletId, "100.00", "BRL");
+      const failingFactory: WageringPortFactory = {
+        forTransaction: (transaction) => {
+          const ports = factory.forTransaction(transaction);
+          return {
+            ...ports,
+            outbox: {
+              append: async (_event) => {
+                throw error;
+              },
             },
-          },
-        };
-      },
+          };
+        },
+      };
+      const process = new ProcessWagerTransactionUseCase(
+        new MikroTransactionRunner(orm.em, 2000, 10000, 1, 1),
+        failingFactory,
+        clock,
+        ids,
+      );
+      await expect(process.execute({
+        providerId: `provider-${id()}`, externalTransactionId: `external-${id()}`,
+        idempotencyKey: `key-${id()}`, playerId, walletId,
+        roundId: `round-${id()}`, gameId: `game-${id()}`,
+        kind: WagerTransactionKind.Bet, money: { amount: "10.00", currency: "BRL" },
+      })).rejects.toBe(error);
+      const rows = (await inspectionPool.query<{
+        balance_amount: string; wagers: string; ledger: string; outbox: string;
+      }>(
+        `select w.balance_amount,
+                (select count(*) from wager_transactions where wallet_id = w.id) as wagers,
+                (select count(*) from wallet_ledger_entries where wallet_id = w.id) as ledger,
+                (select count(*) from outbox_messages where aggregate_id = w.id) as outbox
+         from wallets w where w.id = $1`, [walletId],
+      )).rows[0];
+      expect(rows.balance_amount).toBe("100.00");
+      expect(Number(rows.wagers)).toBe(0);
+      expect(Number(rows.ledger)).toBe(0);
+      expect(Number(rows.outbox)).toBe(0);
+      await assertWalletInvariant(walletId, "100.00");
     };
-    const nativeRunner = {
-      run: async <T>(work: (transaction: SqlTransaction) => Promise<T>): Promise<T> => {
-        const client = await inspectionPool.connect();
-        try {
-          await client.query("begin");
-          const result = await work({
-            execute: async <R extends Record<string, unknown>>(
-              sql: string,
-              params: readonly unknown[] = [],
-            ) => (await client.query(sql, [...params])).rows as R[],
-          });
-          await client.query("commit");
-          return result;
-        } catch (error) {
-          await client.query("rollback");
-          throw error;
-        } finally {
-          client.release();
-        }
-      },
-    };
-    const process = new ProcessWagerTransactionUseCase(nativeRunner, failingFactory, clock, ids);
-    const input = {
-      providerId: `provider-${id()}`, externalTransactionId: `external-${id()}`,
-      idempotencyKey: `key-${id()}`, playerId, walletId,
-      roundId: `round-${id()}`, gameId: `game-${id()}`,
-      kind: WagerTransactionKind.Bet, money: { amount: "10.00", currency: "BRL" },
-    };
-    await expect(process.execute(input)).rejects.toBeInstanceOf(InfrastructureTransientError);
-    const rows = (await inspectionPool.query<{
-      balance_amount: string; wagers: string; ledger: string; outbox: string;
-    }>(
-      `select w.balance_amount,
-              (select count(*) from wager_transactions where wallet_id = w.id) as wagers,
-              (select count(*) from wallet_ledger_entries where wallet_id = w.id) as ledger,
-              (select count(*) from outbox_messages where aggregate_id = w.id) as outbox
-       from wallets w where w.id = $1`, [walletId],
-    )).rows[0];
-    expect(rows.balance_amount).toBe("100.00");
-    expect(Number(rows.wagers)).toBe(1);
-    expect(Number(rows.ledger)).toBe(1);
-    expect(Number(rows.outbox)).toBe(2);
+    await runFailure(new Error("outbox permanent failure"));
+    await runFailure(new InfrastructureTransientError("outbox unavailable"));
   });
 
   test("returns idempotency payload and external identity conflicts without aborting", async () => {

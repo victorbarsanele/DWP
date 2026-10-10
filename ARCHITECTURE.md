@@ -568,6 +568,38 @@ consumer, embora SQS use ack/retry/DLQ em vez de status HTTP.
 | `INVALID_TRANSACTION_KIND` | OPENING externo ou kind inválido | não |
 | `INVALID_MONEY` | Amount/currency inválido | não |
 | `IDEMPOTENCY_KEY_MISSING` | Header ausente/malformado | não |
+
+### 3.4 Implementação HTTP e ciclo de vida
+
+DTOs são validados por funções puras, sem `class-validator`. O controller não
+conhece SQL: usa os mesmos use cases transacionais de criação e processamento,
+mais um serviço read-only para consultas.
+
+`X-Correlation-Id` é gerado no middleware quando ausente, devolvido na resposta
+e propagado ao envelope de eventos. Logs de requisição registram método, rota
+sem query string, status, duração e correlation ID; não registram payload,
+headers completos ou valores monetários.
+
+O filtro global usa `FAILURE_METADATA` como fonte única para status e
+retryability. JSON inválido e validação retornam `VALIDATION_ERROR`; falhas
+transitórias retornam `503` com `Retry-After`; falhas não classificadas retornam
+`500` sem stack.
+
+O bootstrap habilita shutdown hooks do Nest. O ORM e pools são encerrados pelo
+ciclo de vida da aplicação, uma única vez; testes não encerram pool compartilhado
+em hooks de arquivos individuais.
+
+### 3.5 Runner, pool e PostgreSQL
+
+Cada operação cria fork limpo e usa `fork.transactional()` para isolar o
+contexto e a transação MikroORM, sem criar ORM por request. Valores padrão
+testados são `lock_timeout=2000ms`, `statement_timeout=10000ms`,
+`DB_TRANSACTION_RETRIES=3` e backoff inicial de `10ms`. Testes de carga podem
+sobrescrever esses valores.
+
+`23503` (foreign key violation) não é erro transitório; permanece permanente
+(`500`). Classes `40001`, `40P01`, `55P03`, `57014`, `08xxx`, `53xxx` e falhas
+de conexão são transitórias e causam rollback/retry.
 | `VALIDATION_ERROR` | DTO/payload inválido | não |
 | `TRANSACTION_NOT_FOUND` | Transação inexistente | não |
 | `INFRASTRUCTURE_TRANSIENT` | Timeout, conexão ou lock transitório | sim |

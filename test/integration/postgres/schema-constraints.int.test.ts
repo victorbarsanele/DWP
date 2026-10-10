@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import {
   expectPostgresError,
   id,
@@ -506,8 +506,4 @@ describe("PostgreSQL schema guarantees", () => {
       client.release();
     }
   });
-});
-
-afterAll(async () => {
-  await pool.end();
 });
