@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "start": "bun run src/main.ts",
-    "test": "bun run migrate:test:up && bun test --preload ./test/preload.ts --max-concurrency 1 test/integration/postgres",
+    "test": "bun run migrate:test:up && bun test --preload ./test/preload.ts --max-concurrency 1 test/unit test/integration/postgres",
     "test:integration": "bun run migrate:test:up && bun test --preload ./test/preload.ts --max-concurrency 1 test/integration/postgres",
     "test:migration": "bun test --preload ./test/preload.ts ./test/integration/postgres/migration-cycle.int.ts",
     "migrate:test:up": "bun run src/infrastructure/persistence/mikro-orm/migrate.ts test-up",

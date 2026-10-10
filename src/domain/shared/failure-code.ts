@@ -1,0 +1,56 @@
+export enum FailureCode {
+  WalletNotFound = "WALLET_NOT_FOUND",
+  PlayerWalletMismatch = "PLAYER_WALLET_MISMATCH",
+  CurrencyMismatch = "CURRENCY_MISMATCH",
+  InsufficientFunds = "INSUFFICIENT_FUNDS",
+  ReversalInsufficientFunds = "REVERSAL_INSUFFICIENT_FUNDS",
+  InvalidReferenceKind = "INVALID_REFERENCE_KIND",
+  ReferenceNotProcessed = "REFERENCE_NOT_PROCESSED",
+  ReferenceNotFound = "REFERENCE_NOT_FOUND",
+  ReferencePending = "REFERENCE_PENDING",
+  ReferenceIdentityMismatch = "REFERENCE_IDENTITY_MISMATCH",
+  ReferenceCurrencyMismatch = "REFERENCE_CURRENCY_MISMATCH",
+  ReferenceAmountMismatch = "REFERENCE_AMOUNT_MISMATCH",
+  ReferenceAlreadyReversed = "REFERENCE_ALREADY_REVERSED",
+  IdempotencyKeyPayloadMismatch = "IDEMPOTENCY_KEY_PAYLOAD_MISMATCH",
+  ExternalTransactionIdConflict = "EXTERNAL_TRANSACTION_ID_CONFLICT",
+  WalletAlreadyExists = "WALLET_ALREADY_EXISTS",
+  InvalidTransactionKind = "INVALID_TRANSACTION_KIND",
+  InvalidMoney = "INVALID_MONEY",
+  IdempotencyKeyMissing = "IDEMPOTENCY_KEY_MISSING",
+  ValidationError = "VALIDATION_ERROR",
+  TransactionNotFound = "TRANSACTION_NOT_FOUND",
+  InfrastructureTransient = "INFRASTRUCTURE_TRANSIENT",
+  PermanentInfrastructureFailure = "PERMANENT_INFRASTRUCTURE_FAILURE",
+}
+
+export interface FailureMetadata {
+  readonly retryable: boolean;
+  readonly httpStatus: number;
+}
+
+export const FAILURE_METADATA: Readonly<Record<FailureCode, FailureMetadata>> = {
+  [FailureCode.WalletNotFound]: { retryable: false, httpStatus: 404 },
+  [FailureCode.PlayerWalletMismatch]: { retryable: false, httpStatus: 422 },
+  [FailureCode.CurrencyMismatch]: { retryable: false, httpStatus: 422 },
+  [FailureCode.InsufficientFunds]: { retryable: false, httpStatus: 422 },
+  [FailureCode.ReversalInsufficientFunds]: { retryable: false, httpStatus: 422 },
+  [FailureCode.InvalidReferenceKind]: { retryable: false, httpStatus: 422 },
+  [FailureCode.ReferenceNotProcessed]: { retryable: false, httpStatus: 422 },
+  [FailureCode.ReferenceNotFound]: { retryable: false, httpStatus: 422 },
+  [FailureCode.ReferencePending]: { retryable: true, httpStatus: 202 },
+  [FailureCode.ReferenceIdentityMismatch]: { retryable: false, httpStatus: 422 },
+  [FailureCode.ReferenceCurrencyMismatch]: { retryable: false, httpStatus: 422 },
+  [FailureCode.ReferenceAmountMismatch]: { retryable: false, httpStatus: 422 },
+  [FailureCode.ReferenceAlreadyReversed]: { retryable: false, httpStatus: 422 },
+  [FailureCode.IdempotencyKeyPayloadMismatch]: { retryable: false, httpStatus: 409 },
+  [FailureCode.ExternalTransactionIdConflict]: { retryable: false, httpStatus: 409 },
+  [FailureCode.WalletAlreadyExists]: { retryable: false, httpStatus: 409 },
+  [FailureCode.InvalidTransactionKind]: { retryable: false, httpStatus: 400 },
+  [FailureCode.InvalidMoney]: { retryable: false, httpStatus: 400 },
+  [FailureCode.IdempotencyKeyMissing]: { retryable: false, httpStatus: 400 },
+  [FailureCode.ValidationError]: { retryable: false, httpStatus: 400 },
+  [FailureCode.TransactionNotFound]: { retryable: false, httpStatus: 404 },
+  [FailureCode.InfrastructureTransient]: { retryable: true, httpStatus: 503 },
+  [FailureCode.PermanentInfrastructureFailure]: { retryable: false, httpStatus: 500 },
+};

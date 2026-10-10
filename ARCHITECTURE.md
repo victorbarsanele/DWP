@@ -141,6 +141,10 @@ Replay sempre envia `idempotentReplay: true` e status atual. Extensão para
 `REJECTED` e `PENDING_REFERENCE` é interpretação deste projeto, não alteração
 silenciosa do enunciado.
 
+`Money.from` rejeita negativos e `Money` pode produzir negativos somente por
+`subtract`/`negate` interno. Entrada aceita 0–2 casas, normaliza para duas e
+rejeita mais de 17 dígitos inteiros (limite de `numeric(19,2)`).
+
 **Alternativas descartadas.** Recalcular saldo atual, guardar snapshot apenas
 em cache, sobrescrever snapshot terminal.
 
@@ -185,6 +189,9 @@ Uma referência aceita uma única reversão processada, independentemente do tip
 `ROLLBACK` de `REFUND` continua válido porque referência é o próprio REFUND.
 Interpretação mais estrita da regra 4.
 
+Domínio expõe decisão `assertReversalNotAlreadyProcessed`; consulta de
+existência prévia e constraint parcial pertencem à etapa transacional.
+
 **Alternativas descartadas.** Unicidade por `(reference_transaction_id, kind)`,
 checagem apenas em código, permitir duas operações compensatórias.
 
@@ -201,11 +208,11 @@ validação inicial da migration.
 
 **Contexto.** Enunciado exige referência para REFUND/ROLLBACK, mas não para WIN.
 
-**Decisão.** `WIN` pode ser crédito independente. Se referência existir, deve
-ser `BET` `PROCESSED` da mesma provider, player, wallet, moeda e rodada.
-REFUND referencia somente BET; ROLLBACK referencia BET, WIN ou REFUND.
-LOSS, ROLLBACK e OPENING nunca podem ser referência válida. Valor deve ser
-igual ao da referência; referência deve estar `PROCESSED`.
+**Decisão.** `WIN` e `LOSS` aceitam referência opcional. Quando presente, deve
+ser `BET` `PROCESSED` do mesmo provider, player, wallet, moeda e rodada; valor
+não é comparado. REFUND referencia somente BET; ROLLBACK referencia BET, WIN
+ou REFUND e compara valor exatamente. LOSS não move saldo; OPENING nunca é
+referência externa.
 
 Cada falha tem `failureCode` distinto: kind inválido, referência não
 processada, identidade divergente, moeda divergente e valor divergente.
@@ -237,12 +244,15 @@ movimento de lançamento financeiro.
 
 **Contexto.** Entrega fora de ordem é esperada.
 
-**Decisão.** Referência ausente persiste `PENDING_REFERENCE`, sem ledger, com
-evento pending. Worker usa:
+**Decisão.** Para REFUND/ROLLBACK, referência ausente ou ainda
+`PENDING_REFERENCE` persiste `PENDING_REFERENCE`, sem ledger, com evento
+pending. Referência `REJECTED`/`FAILED` gera `REJECTED` com
+`REFERENCE_NOT_PROCESSED`. Worker usa:
 
 - TTL desde `createdAt`: 15 minutos, terminador principal;
 - máximo: 8 tentativas, teto de segurança;
-- rejeita quando `now >= createdAt + TTL` ou `attempts >= 8`;
+- rejeita quando `now >= createdAt + TTL` ou `attempts >= 8`, com
+  `REFERENCE_NOT_FOUND` terminal e `retryable: false`;
 - backoff: `delay = min(2s * 2^attempt, 120s) + jitter`;
 - base, fator, cap, TTL e máximo vêm de ambiente;
 - expiração vira `REJECTED` + `REFERENCE_NOT_FOUND`, snapshot e evento na
@@ -513,11 +523,11 @@ Todo erro ou rejeição usa:
 | 409 | Hash divergente | `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | não |
 | 409 | External ID ocupado por outra operação | `EXTERNAL_TRANSACTION_ID_CONFLICT` | não |
 | 409 | Wallet duplicada | `WALLET_ALREADY_EXISTS` | não |
-| 400 | Key ausente/malformada, OPENING externo, Money/payload inválido | `INVALID_REQUEST` | não |
-| 404 | GET de recurso inexistente | `RESOURCE_NOT_FOUND` | não |
-| 503 | PostgreSQL/SQS indisponível ou timeout de lock | `INFRASTRUCTURE_UNAVAILABLE` | sim, `Retry-After` |
+| 400 | Key ausente/malformada, OPENING externo, Money/payload inválido | `IDEMPOTENCY_KEY_MISSING` / `INVALID_TRANSACTION_KIND` / `INVALID_MONEY` / `VALIDATION_ERROR` | não |
+| 404 | Wallet ou transação inexistente | `WALLET_NOT_FOUND` / `TRANSACTION_NOT_FOUND` | não |
+| 503 | PostgreSQL/SQS indisponível ou timeout de lock | `INFRASTRUCTURE_TRANSIENT` | sim, `Retry-After` |
 | 500 | Erro inesperado não classificado | `UNEXPECTED_ERROR` | não presumir |
-| PENDENTE | Erro permanente gravado como FAILED | `PERMANENT_INFRASTRUCTURE_FAILURE` | não |
+| 500 | Erro permanente gravado como FAILED | `PERMANENT_INFRASTRUCTURE_FAILURE` | não |
 
 Status e corpo devem ser iguais em HTTP e na transformação de resultado do
 consumer, embora SQS use ack/retry/DLQ em vez de status HTTP.
@@ -537,16 +547,24 @@ consumer, embora SQS use ack/retry/DLQ em vez de status HTTP.
 | `REFERENCE_CURRENCY_MISMATCH` | Moeda da referência diverge | não |
 | `REFERENCE_AMOUNT_MISMATCH` | Valor não é igual ao da referência | não |
 | `REFERENCE_ALREADY_REVERSED` | Índice parcial detectou reversão | não |
-| `REFERENCE_NOT_FOUND` | Pending expirou ou atingiu teto | sim* |
+| `REFERENCE_NOT_FOUND` | Pending expirou ou atingiu teto | não |
+| `REFERENCE_PENDING` | Referência ausente ou ainda pending | sim |
 | `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | Mesmo key, payload divergente | não |
 | `EXTERNAL_TRANSACTION_ID_CONFLICT` | External ID já usado | não |
 | `WALLET_ALREADY_EXISTS` | Player + moeda já existem | não |
+| `INVALID_TRANSACTION_KIND` | OPENING externo ou kind inválido | não |
+| `INVALID_MONEY` | Amount/currency inválido | não |
+| `IDEMPOTENCY_KEY_MISSING` | Header ausente/malformado | não |
+| `VALIDATION_ERROR` | DTO/payload inválido | não |
+| `TRANSACTION_NOT_FOUND` | Transação inexistente | não |
+| `INFRASTRUCTURE_TRANSIENT` | Timeout, conexão ou lock transitório | sim |
+| `PERMANENT_INFRASTRUCTURE_FAILURE` | Falha permanente auditável em FAILED | não |
 
-`REFERENCE_NOT_FOUND` é `retryable: true` como instrução operacional, mas
-estado `REJECTED` é terminal; novo envio exige novo external ID e nova key.
+`REFERENCE_NOT_FOUND` é terminal e não retryable. `REFERENCE_PENDING` representa
+somente estado 202; novo envio durante pending reutiliza mesma key.
 
-Itens ainda não implementados são `PENDENTE`: códigos finais de erros de
-infraestrutura, códigos completos de validação DTO e contrato de `FAILED`.
+Etapa 2 define tabela única de códigos; mapeamento de exceções concretas para
+HTTP e contrato operacional de `FAILED` permanecem PENDENTE até etapa 3/4.
 
 ## 4. Limitações e pendências
 
