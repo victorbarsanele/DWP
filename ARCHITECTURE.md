@@ -24,8 +24,8 @@ PostgreSQL é fonte de verdade das invariantes:
 - ao fim de cada teste: saldo materializado igual ao saldo reconstruído pelo
   ledger.
 
-Autenticação não pontua no desafio. Será `AuthGuard` no-op, documentado e
-substituível por `ProviderIdentityPort`. Health checks permanecem abertos;
+Autenticação não pontua no desafio. `ProviderAuthGuard` é no-op, aplicado às
+rotas de wallet e substituível por `ProviderIdentityPort`. Health checks permanecem abertos;
 mensagens SQS são canal interno confiável, mas payload continua sujeito às
 regras de domínio.
 
@@ -322,7 +322,11 @@ commit, ack antes do commit.
 precisam deduplicar por `eventId`. Em troca, evento confirmado não se perde por
 crash entre commit e publicação.
 
-**Evidência.** PENDENTE: atomicidade e crash recovery na etapa 5.
+**Evidência.** A Etapa 4 cobre atomicidade entre inbox e efeitos financeiros,
+ack pós-commit, redelivery e rollback em
+[wager-transaction-consumer.int.test.ts](./test/integration/sqs/wager-transaction-consumer.int.test.ts).
+Publicação Outbox concorrente e recuperação de evento já commitado também
+passaram nos testes da Etapa 5 no mesmo arquivo.
 
 ### 2.13 Publisher com SKIP LOCKED
 
@@ -342,9 +346,12 @@ assumir atomicidade banco/SQS.
 **Trade-offs.** Lote pequeno e timeout limitam contenção, mas lock pode durar
 durante rede. Duplicata é preferida a perda de evento.
 
-**Evidência.** PENDENTE: publisher concorrente e fila
-`wager-events.fifo` na etapa 5. [Spike item 7](./spike/REPORT.md#7-localstack-sqs-fifo)
-confirmou dedup SQS e head-of-line blocking, não publisher de produção.
+**Evidência.** `two concurrent publishers claim and publish every Outbox event
+once` e `committed events recover after restart and failed sends persist
+backoff` em
+[wager-transaction-consumer.int.test.ts](./test/integration/sqs/wager-transaction-consumer.int.test.ts).
+O [Spike item 7](./spike/REPORT.md#7-localstack-sqs-fifo) também confirmou
+dedup SQS e head-of-line blocking.
 
 ### 2.14 SQS FIFO como otimização
 
@@ -366,24 +373,29 @@ FIFO, dedup SQS como idempotência financeira.
 falha lenta bloqueia grupo.
 
 **Evidência.** [Spike item 7](./spike/REPORT.md#7-localstack-sqs-fifo) confirmou
-redelivery, DLQ, dedup e head-of-line. SIGTERM ainda não foi validado em Linux.
+redelivery, DLQ, dedup e head-of-line. A integração da Etapa 4 valida
+redelivery, DLQ e encerramento pelo lifecycle Nest; sinal SIGTERM do processo
+em container Linux permanece pendente.
 
-### 2.15 FAILED em transação separada
+### 2.15 Erros permanentes e DLQ
 
-**Contexto.** Erro permanente ou tentativas esgotadas precisa ser auditável
-antes da DLQ.
+**Contexto.** Mensagens inválidas ou falhas após limite de tentativas precisam
+chegar à DLQ sem perder mensagem.
 
-**Decisão.** Consumidor, ao classificar erro permanente ou esgotar retries,
-abre transação separada e grava `FAILED`; somente depois envia mensagem à DLQ.
-`FAILED` é terminal e não reenviável automaticamente.
+**Decisão.** Resultado de negócio é terminal e recebe ack após commit. Payload
+inválido ou conflito de hash Inbox é logado sem payload e não recebe ack; SQS
+aplica `maxReceiveCount` e redrive para a DLQ. Falhas de infraestrutura recebem
+backoff por `ChangeMessageVisibility` e também acabam no redrive configurado.
+Não gravar `FAILED` para mensagem que não produziu uma wager.
 
-**Alternativas descartadas.** Enviar DLQ sem registro, marcar FAILED na mesma
-transação financeira falha, retry infinito.
+**Alternativas descartadas.** Ack de mensagem inválida, retry infinito,
+transação financeira parcial para registrar falha.
 
-**Trade-offs.** Existe janela entre FAILED e envio DLQ; estado auditável
-permanece mesmo se envio precisar retry.
+**Trade-offs.** Redrive é controlado pelo broker; Inbox e idempotência no banco
+continuam sendo garantias contra duplicação de efeitos.
 
-**Evidência.** PENDENTE: consumer, classificação e teste DLQ na etapa 5.
+**Evidência.** Testes reais com LocalStack cobrem retry e DLQ em
+[wager-transaction-consumer.int.test.ts](./test/integration/sqs/wager-transaction-consumer.int.test.ts).
 
 ### 2.16 MikroORM com fork por operação
 
@@ -425,8 +437,9 @@ lista versões do spike e versões atuais consultadas.
 
 **Contexto.** Autenticação não recebe pontos e consumiria tempo de invariantes.
 
-**Decisão.** Implementar `AuthGuard` no-op, documentar extensão para IdP externo
-e manter health checks sem autenticação.
+**Decisão.** `ProviderAuthGuard` no-op protege as rotas de wallet sem impor
+autenticação local; pode ser substituído por integração com IdP. Health checks
+permanecem sem autenticação.
 
 **Alternativas descartadas.** Tabela própria de usuários, senha artesanal,
 implementar Keycloak nesta etapa.
@@ -470,11 +483,11 @@ delete with SQLSTATE 55000`; [migration-cycle.int.ts](./test/integration/postgre
 
 **Contexto.** Unique violation aborta transação PostgreSQL.
 
-**Decisão.** Etapa futura usa `INSERT ... ON CONFLICT DO NOTHING RETURNING`
+**Decisão.** Repositories usam `INSERT ... ON CONFLICT DO NOTHING RETURNING`
 sem alvo explícito. Colisões por `idempotency_key` e por
 `(provider_id, external_transaction_id)` retornam vazio e seguem com SELECT na
-mesma transação `READ COMMITTED`. Mensagem inválida não cria linha: consumer
-faz log estruturado, métrica, DLQ e ack para evitar loop.
+mesma transação `READ COMMITTED`. Mensagem inválida não cria linha financeira:
+consumer faz log estruturado, não confirma e deixa SQS encaminhar à DLQ.
 
 **Alternativas descartadas.** Capturar unique violation e continuar, cache,
 dedup somente SQS.
@@ -505,8 +518,8 @@ recebido de provedor.
 **Trade-offs.** Criação ganha uma linha financeira, mantendo reconciliação
 completa desde origem.
 
-**Evidência.** PENDENTE: caso de criação de wallet e ledger OPENING pertencem à
-etapa de use case.
+**Evidência.** `creates wallet with atomic opening and processes BET` em
+[wagering-use-case.int.test.ts](./test/integration/postgres/wagering-use-case.int.test.ts).
 
 ## 3. HTTP e failureCode
 
@@ -613,30 +626,38 @@ HTTP e contrato operacional de `FAILED` permanecem PENDENTE até etapa 3/4.
 
 ## 4. Limitações e pendências
 
-- **PENDENTE — SIGTERM em Linux/CI.** Bun filho no Windows não executou handler
-  SIGTERM após duas tentativas. Validar `beforeApplicationShutdown` no container
-  Linux; consumidor deve concluir mensagem ou devolver visibilidade antes de
-  encerrar.
+- **Concluído — etapa 4.** Consumidor SQS provisiona filas FIFO e DLQ,
+  processa Inbox na transação financeira, confirma após commit, aplica backoff,
+  deixa falhas permanentes seguirem redrive e aguarda trabalho em andamento no
+  shutdown. Integração usa PostgreSQL e LocalStack reais.
+- **Concluído — SIGTERM real.** Processo Bun no container Linux recebeu SIGTERM;
+  log `sqs.lifecycle.shutdown_complete` confirmou drenagem dos workers antes do
+  encerramento (exit `143`, status esperado após reenvio do sinal).
 - **Concluído — item 8 da Etapa 1.** `nest-lock.int.test.ts` valida DI
   Nest, `EntityManager.fork()`, transação MikroORM, lock pessimista e SQL
-  `FOR UPDATE` sob `bun test`. Ida/volta SQS real permanece pendente na etapa
-  de mensageria.
+  `FOR UPDATE` sob `bun test`.
 - **Linha 4 revisada.** Testes de migration usam banco separado via
   `TEST_DATABASE_URL`; `bun test` normal não executa teardown `down`. Ciclo
   destrutivo roda apenas em `test:migration`.
-- **PENDENTE — produção.** Use case, migrations definitivas, repositories,
-  inbox/outbox, workers, observabilidade, reconciliação e API ainda não existem.
-- **PENDENTE — replay.** Testar snapshot congelado para PROCESSED, REJECTED e
-  PENDING_REFERENCE após novas movimentações.
-- **PENDENTE — referências.** Testar duas reversões concorrentes e todos
-  failureCodes de identidade, kind, moeda, valor e status.
-- **PENDENTE — reconciliação.** Ler saldo materializado e ledger no mesmo
-  statement ou sob lock compartilhado; nunca corrigir divergência
-  silenciosamente.
-- **PENDENTE — outbox.** Testar publishers concorrentes, crash após publicação
-  e dedup por `eventId`.
-- **PENDENTE — mensagem inválida.** Payload não parseável não gera linha:
-  log estruturado, métrica, DLQ e ack da mensagem original.
+- **Concluído — etapa 5.** Publisher Outbox usa `FOR UPDATE SKIP LOCKED`,
+  FIFO/dedup por `eventId`, retry persistido e recovery de eventos commitados.
+- **Concluído — etapa 6.** Resolver de referências pendentes usa backoff,
+  limite e TTL. Ledger tem consulta paginada; reconciliação detecta divergência
+  sem corrigir saldo. Health verifica PostgreSQL/SQS e métricas Prometheus
+  cobrem duplicatas, retries, conflitos, DLQ, status, duração e atraso Outbox.
+  Evidências: [docs/ETAPA6_REPORT.md](docs/ETAPA6_REPORT.md) e
+  [operations-api.int.test.ts](test/integration/sqs/operations-api.int.test.ts).
+- **Concluído — etapa 7.** Três stacks independentes de persistência e domínio
+  compartilham PostgreSQL; 50 requisições idênticas geram um débito. Encerrar e
+  recriar uma stack preserva replay e invariante. Teste adicional inicia três
+  processos Bun independentes, distribui 50 requisições pela API e verifica
+  replay após reiniciar um processo. Evidências:
+  [multi-instance-restart.int.test.ts](test/integration/postgres/multi-instance-restart.int.test.ts),
+  [multi-process-restart.int.test.ts](test/integration/postgres/multi-process-restart.int.test.ts)
+  e [docs/VALIDATION.md](docs/VALIDATION.md).
+- **Concluído — etapa 8.** README cobre setup, rotas e testes; lista de falhas
+  eliminatórias revisada. Evidências consolidadas em
+  [docs/VALIDATION.md](docs/VALIDATION.md).
 - **PENDENTE — versões.** Upgrade para versões atuais só após spike específico;
   não misturar major upgrades com implementação financeira.
 - **Limitação conhecida.** `@mikro-orm/nestjs` publicado no spike foi 6.1.2,
