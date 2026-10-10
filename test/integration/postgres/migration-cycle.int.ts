@@ -7,7 +7,7 @@ describe("reversible migrations", () => {
   it("runs up, down, up and restores schema", async () => {
     const orm = await MikroORM.init(mikroOrmOptions());
     try {
-      await orm.getMigrator().down();
+      await orm.getMigrator().down({ to: 0 });
       const afterDown = await orm.em.getConnection().execute<{ exists: boolean }[]>(
         `select exists (
           select 1 from information_schema.tables where table_name = 'wallets'

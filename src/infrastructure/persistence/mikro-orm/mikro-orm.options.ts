@@ -24,6 +24,11 @@ export function mikroOrmOptions() {
       path: "src/infrastructure/persistence/mikro-orm/migrations",
       tableName: "mikro_orm_migrations",
     },
-    pool: { min: 2, max: 10 },
+    pool: {
+      min: Number(process.env.DB_POOL_MIN ?? "0"),
+      max: Number(process.env.DB_POOL_MAX ?? "10"),
+      acquireTimeoutMillis: Number(process.env.DB_POOL_ACQUIRE_TIMEOUT_MS ?? "15000"),
+      idleTimeoutMillis: Number(process.env.DB_POOL_IDLE_TIMEOUT_MS ?? "100"),
+    },
   };
 }

@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:16.4-alpine
+    # Somente dev/teste: desativa durabilidade para acelerar validação local.
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
     environment:
       POSTGRES_USER: spike
       POSTGRES_PASSWORD: spike

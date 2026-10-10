@@ -95,7 +95,8 @@ export class Migration20261010000000 extends Migration {
         constraint wager_provider_external_unique
           unique (provider_id, external_transaction_id),
         constraint wager_wallet_fk
-          foreign key (wallet_id) references wallets(id) on delete restrict,
+          foreign key (wallet_id) references wallets(id) on delete restrict
+          deferrable initially deferred,
         constraint wager_reference_fk
           foreign key (reference_transaction_id)
           references wager_transactions(id) on delete restrict

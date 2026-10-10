@@ -57,6 +57,8 @@ export interface WagerTransactionState {
   readonly referenceTransactionId?: string;
   readonly failureCode?: FailureCode;
   readonly processedAt?: Date;
+  readonly resultBalance?: Money;
+  readonly resultWalletVersion?: number;
 }
 
 export interface CreateWagerTransactionProps extends Omit<
@@ -83,6 +85,8 @@ export class WagerTransaction {
     private _referenceTransactionId?: string,
     private _failureCode?: FailureCode,
     private _processedAt?: Date,
+    public readonly resultBalance?: Money,
+    public readonly resultWalletVersion?: number,
   ) {}
 
   static create(props: CreateWagerTransactionProps): WagerTransaction {
@@ -136,6 +140,8 @@ export class WagerTransaction {
       state.referenceTransactionId,
       state.failureCode,
       state.processedAt === undefined ? undefined : new Date(state.processedAt),
+      state.resultBalance,
+      state.resultWalletVersion,
     );
   }
 

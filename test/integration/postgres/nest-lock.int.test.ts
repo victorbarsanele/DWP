@@ -1,5 +1,5 @@
 import "reflect-metadata";
-import { EntityManager, LockMode } from "@mikro-orm/postgresql";
+import { EntityManager, LockMode, MikroORM } from "@mikro-orm/postgresql";
 import { MikroOrmModule } from "@mikro-orm/nestjs";
 import { Injectable, Module } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
@@ -62,6 +62,7 @@ describe("Nest DI and pessimistic wallet lock", () => {
     );
     expect(applied.filter(Boolean)).toHaveLength(1);
     expect(result.rows[0]?.balance_amount).toBe("20.00");
+    await testingModule.get(MikroORM).close(true);
     await testingModule.close();
   });
 });

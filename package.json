@@ -5,9 +5,12 @@
   "scripts": {
     "build": "tsc --noEmit",
     "start": "bun run src/main.ts",
-    "test": "bun run migrate:test:up && bun test --preload ./test/preload.ts --max-concurrency 1 test/unit test/integration/postgres",
-    "test:integration": "bun run migrate:test:up && bun test --preload ./test/preload.ts --max-concurrency 1 test/integration/postgres",
-    "test:migration": "bun test --preload ./test/preload.ts ./test/integration/postgres/migration-cycle.int.ts",
+    "test": "bun run migrate:test:up && bun test --timeout 30000 --preload ./test/preload.ts --max-concurrency 1 test/unit test/integration/postgres",
+    "test:unit": "bun test --timeout 30000 --preload ./test/preload.ts --max-concurrency 1 test/unit",
+    "test:int": "bun run migrate:test:up && bun test --timeout 30000 --preload ./test/preload.ts --max-concurrency 1 test/integration/postgres",
+    "test:file": "bun test --timeout 30000 --preload ./test/preload.ts --max-concurrency 1",
+    "test:integration": "bun run migrate:test:up && bun test --timeout 30000 --preload ./test/preload.ts --max-concurrency 1 test/integration/postgres",
+    "test:migration": "bun test --timeout 30000 --preload ./test/preload.ts ./test/integration/postgres/migration-cycle.int.ts",
     "migrate:test:up": "bun run src/infrastructure/persistence/mikro-orm/migrate.ts test-up",
     "migrate:up": "bun run src/infrastructure/persistence/mikro-orm/migrate.ts up",
     "migrate:down": "bun run src/infrastructure/persistence/mikro-orm/migrate.ts down"

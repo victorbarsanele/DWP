@@ -115,3 +115,40 @@ export async function insertWager(
   );
   return values.id;
 }
+
+export async function assertWalletInvariant(
+  walletId: string,
+  databasePool: pg.Pool = pool,
+): Promise<void> {
+  const walletResult = await databasePool.query<{ balance_amount: string }>(
+    "select balance_amount::text from wallets where id = $1",
+    [walletId],
+  );
+  expect(walletResult.rows).toHaveLength(1);
+
+  const ledgerResult = await databasePool.query<{
+    transaction_id: string;
+    balance_before: string;
+    balance_after: string;
+  }>(
+    `select transaction_id, balance_before::text, balance_after::text
+       from wallet_ledger_entries
+      where wallet_id = $1
+      order by created_at, id`,
+    [walletId],
+  );
+  const transactionIds = ledgerResult.rows.map((row) => row.transaction_id);
+  expect(new Set(transactionIds).size).toBe(transactionIds.length);
+
+  if (ledgerResult.rows.length > 0) {
+    expect(ledgerResult.rows[0]?.balance_before).toBe("0.00");
+    for (let index = 1; index < ledgerResult.rows.length; index += 1) {
+      expect(ledgerResult.rows[index]?.balance_before)
+        .toBe(ledgerResult.rows[index - 1]?.balance_after);
+    }
+    expect(ledgerResult.rows.at(-1)?.balance_after)
+      .toBe(walletResult.rows[0]?.balance_amount);
+  } else {
+    expect(walletResult.rows[0]?.balance_amount).toBe("0.00");
+  }
+}

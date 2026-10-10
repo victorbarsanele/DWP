@@ -73,6 +73,10 @@ MikroORM não exponha forma estável.
 **Alternativas descartadas.** Cache em memória, unique violation capturada
 dentro da transação, idempotência baseada apenas em SQS.
 
+**Evidência.** `returns idempotency payload and external identity conflicts
+without aborting` em
+[wagering-use-case.int.test.ts](./test/integration/postgres/wagering-use-case.int.test.ts).
+
 **Trade-offs.** SQL raw reduz abstração ORM, mas evita estado transacional
 abortado e torna retorno vencedor/concorrente explícito.
 
@@ -171,7 +175,8 @@ status apenas em memória.
 **Trade-offs.** Use case precisa separar resultado de negócio de falha
 operacional, mas retries e auditoria ficam corretos.
 
-**Evidência.** PENDENTE: cobrir no use case e teste PostgreSQL da etapa 3.
+**Evidência.** `commits business rejection and replays original snapshot` em
+[wagering-use-case.int.test.ts](./test/integration/postgres/wagering-use-case.int.test.ts).
 
 ### 2.7 Reversão única por referência
 
@@ -287,7 +292,15 @@ lock global.
 **Trade-offs.** Regra simples reduz deadlock; exige validar wallet antes de
 consultar/lockar referência.
 
-**Evidência.** PENDENTE: deadlock/race será testado com três processos.
+**Evidência.** `serializes concurrent bets on one wallet`, `processes 50 of 100
+bets with bounded parallelism` e `serializes concurrent REFUND and ROLLBACK`
+em [wagering-use-case.int.test.ts](./test/integration/postgres/wagering-use-case.int.test.ts).
+
+**Correção de FK.** `wager_transactions.wallet_id` usa FK
+`DEFERRABLE INITIALLY DEFERRED`. O insert de idempotência continua antes do
+lock da wallet, mas não mantém `KEY SHARE` durante o lock `FOR UPDATE`;
+isso elimina deadlock estrutural entre submits paralelos. Integrado em
+`Migration20261010000001`.
 
 ### 2.12 Inbox e outbox transacionais
 
@@ -597,3 +610,27 @@ HTTP e contrato operacional de `FAILED` permanecem PENDENTE até etapa 3/4.
 - **Limitação conhecida.** `@mikro-orm/nestjs` publicado no spike foi 6.1.2,
   enquanto core/driver/migrations ficaram em 6.3.13; integração Nest + fork +
   transactional passou, mas upgrade conjunto merece validação.
+# Etapa 3a: transação e persistência
+
+O hot path usa `EntityManager.fork()` e `transactional()` por operação. Os
+adapters executam SQL explícito para evitar dependência do Unit of Work em
+linhas inseridas por SQL raw. `lock_timeout` e `statement_timeout` são
+configuráveis por `DB_LOCK_TIMEOUT_MS`, `DB_STATEMENT_TIMEOUT_MS`,
+`DB_TRANSACTION_RETRIES` e `DB_TRANSACTION_RETRY_BACKOFF_MS`. Defaults:
+`2000ms`, `10000ms`, `3` tentativas e `10ms * tentativa`.
+
+Pool padrão usa `min=2`, `max=10`; integração usa um ORM e um pool de inspeção
+únicos por arquivo, ambos encerrados em `afterAll`. PostgreSQL local usa
+`max_connections=100`. Teste de 100 apostas dispara lotes de dois para manter
+paralelismo real sem exceder pool.
+
+Inserção de wager usa `ON CONFLICT DO NOTHING RETURNING` sem alvo; colisões são
+resolvidas por idempotency key e depois por identidade externa. Rejeições de
+negócio atualizam wager, snapshot e outbox dentro da mesma transação, sem lançar
+exceção. Replay usa snapshot persistido, não saldo atual.
+
+CreateWallet grava OPENING, ledger CREDIT e eventos na mesma transação quando
+saldo inicial é positivo. Saldo inicial zero não cria OPENING.
+
+Evidência: [docs/ETAPA3A_REPORT.md](docs/ETAPA3A_REPORT.md) e
+[wagering-use-case.int.test.ts](test/integration/postgres/wagering-use-case.int.test.ts).
