@@ -7,6 +7,7 @@ import { Wallet } from "../../domain/wallet/wallet";
 import { IntegrationEvent } from "../../domain/events/integration-event";
 import { WalletLedgerEntry } from "../../domain/ledger/wallet-ledger-entry";
 import { SqlTransaction, TransactionRunnerPort } from "./transaction-runner.port";
+import { InboxRepositoryPort } from "./inbox-message.port";
 
 export interface NewWagerRecord {
   readonly id: string;
@@ -25,6 +26,16 @@ export interface NewWagerRecord {
   readonly createdAt: Date;
 }
 
+export interface PendingReferenceCandidate {
+  readonly id: string;
+  readonly walletId: string;
+}
+
+export interface LockedPendingReference {
+  readonly transaction: WagerTransaction;
+  readonly attempts: number;
+}
+
 export interface WagerRepositoryPort {
   insertIfAbsent(record: NewWagerRecord): Promise<string | undefined>;
   findByIdempotencyKey(key: string): Promise<WagerTransaction | undefined>;
@@ -33,6 +44,11 @@ export interface WagerRepositoryPort {
     externalTransactionId: string,
   ): Promise<WagerTransaction | undefined>;
   findById(id: string): Promise<WagerTransaction | undefined>;
+  findNextPendingReference(now: Date): Promise<PendingReferenceCandidate | undefined>;
+  findPendingReferenceForUpdate(
+    id: string,
+    now: Date,
+  ): Promise<LockedPendingReference | undefined>;
   findReferenceForUpdate(
     providerId: string,
     externalTransactionId: string,
@@ -66,6 +82,7 @@ export interface WageringPorts {
   readonly wagers: WagerRepositoryPort;
   readonly wallets: WalletRepositoryPort;
   readonly ledger: LedgerRepositoryPort;
+  readonly inbox: InboxRepositoryPort;
   readonly outbox: OutboxWriterPort;
 }
 

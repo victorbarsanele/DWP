@@ -22,6 +22,8 @@ import {
 } from "../ports/wagering.ports";
 import { ProcessWagerInput, WagerResult } from "../dto/wagering.dto";
 import { payloadHash } from "../services/payload-hash";
+import { InboxMessageRecord } from "../ports/inbox-message.port";
+import { MetricsRegistry } from "../services/metrics.registry";
 
 export class ProcessWagerTransactionUseCase {
   constructor(
@@ -30,14 +32,264 @@ export class ProcessWagerTransactionUseCase {
     private readonly clock: ClockPort,
     private readonly ids: IdGeneratorPort,
     private readonly pendingBackoffSeconds = 2,
+    private readonly pendingMaxAttempts = 5,
+    private readonly pendingTtlMs = 86_400_000,
+    private readonly pendingMaxBackoffSeconds = 300,
+    private readonly metrics?: MetricsRegistry,
   ) {}
 
   async execute(input: ProcessWagerInput): Promise<WagerResult> {
+    const startedAt = performance.now();
+    try {
+      const result = await this.run(input);
+      if (
+        result.idempotentReplay
+        || result.failureCode === FailureCode.IdempotencyKeyPayloadMismatch
+      ) {
+        this.metrics?.increment("idempotency_duplicates_total");
+      }
+      this.logOutcome(input, result);
+      return result;
+    } finally {
+      this.metrics?.observeWagerProcessingDuration(performance.now() - startedAt);
+    }
+  }
+
+  async executeFromInbox(
+    input: ProcessWagerInput,
+    inbox: Omit<InboxMessageRecord, "receivedAt">,
+  ): Promise<WagerResult | undefined> {
+    const startedAt = performance.now();
     const money = Money.from(input.money);
     const hash = payloadHash(input);
     const now = this.clock.now();
+    try {
+      const result = await this.runner.run(async (sql) => {
+        const currentPorts = this.ports.forTransaction(sql);
+        const inserted = await currentPorts.inbox.insertIfAbsent({
+          ...inbox,
+          receivedAt: now,
+        });
+        if (!inserted) return undefined;
+        try {
+          return await this.processTransaction(input, money, hash, now, currentPorts);
+        } finally {
+          await currentPorts.inbox.markProcessed(inbox.consumerName, inbox.messageId, now);
+        }
+      });
+      if (result === undefined) {
+        this.metrics?.increment("inbox_duplicates_total");
+      } else if (
+        result.idempotentReplay
+        || result.failureCode === FailureCode.IdempotencyKeyPayloadMismatch
+      ) {
+        this.metrics?.increment("idempotency_duplicates_total");
+      }
+      this.logOutcome(input, result, inbox.messageId);
+      return result;
+    } finally {
+      this.metrics?.observeWagerProcessingDuration(performance.now() - startedAt);
+    }
+  }
+
+  private logOutcome(
+    input: ProcessWagerInput,
+    result: WagerResult | undefined,
+    messageId?: string,
+  ): void {
+    console.log(JSON.stringify({
+      event: "wager.transaction.completed",
+      correlationId: input.correlationId ?? null,
+      messageId: messageId ?? null,
+      transactionId: result?.transactionId ?? null,
+      walletId: input.walletId,
+      providerId: input.providerId,
+      status: result?.status ?? "INBOX_DUPLICATE",
+      failureCode: result?.failureCode ?? null,
+    }));
+  }
+
+  async resolveNextPendingReference(): Promise<boolean> {
+    const now = this.clock.now();
     return this.runner.run(async (sql) => {
       const currentPorts = this.ports.forTransaction(sql);
+      const candidate = await currentPorts.wagers.findNextPendingReference(now);
+      if (candidate === undefined) return false;
+
+      const wallet = await currentPorts.wallets.findById(candidate.walletId, true);
+      if (wallet === undefined) throw new Error("pending reference wallet no longer exists");
+      const pending = await currentPorts.wagers.findPendingReferenceForUpdate(candidate.id, now);
+      if (pending === undefined) return true;
+
+      const transaction = pending.transaction;
+      const attempts = pending.attempts + 1;
+      const reference = transaction.referenceExternalTransactionId === undefined
+        ? undefined
+        : await currentPorts.wagers.findReferenceForUpdate(
+          transaction.providerId,
+          transaction.referenceExternalTransactionId,
+        );
+      const decision = transaction.validateReference(reference);
+
+      if (decision.type === "WAIT") {
+        const expired = attempts >= this.pendingMaxAttempts
+          || now.getTime() - transaction.createdAt.getTime() >= this.pendingTtlMs;
+        if (expired) {
+          transaction.reject(
+            reference === undefined
+              ? FailureCode.ReferenceNotFound
+              : FailureCode.ReferenceNotProcessed,
+            now,
+          );
+          await currentPorts.wagers.updateDecision({
+            transaction,
+            snapshot: wallet.balance,
+            walletVersion: wallet.version,
+            attempts,
+            nextAttemptAt: null,
+          });
+          await this.writeRejected(currentPorts, transaction, transaction.id, now);
+          return true;
+        }
+
+        this.metrics?.increment("retries_total");
+        const delaySeconds = Math.min(
+          this.pendingMaxBackoffSeconds,
+          this.pendingBackoffSeconds * 2 ** pending.attempts,
+        );
+        await currentPorts.wagers.updateDecision({
+          transaction,
+          snapshot: wallet.balance,
+          walletVersion: wallet.version,
+          attempts,
+          nextAttemptAt: new Date(now.getTime() + delaySeconds * 1000),
+        });
+        return true;
+      }
+
+      if (decision.type === "REJECT") {
+        transaction.reject(decision.code, now);
+        await currentPorts.wagers.updateDecision({
+          transaction,
+          snapshot: wallet.balance,
+          walletVersion: wallet.version,
+          attempts,
+          nextAttemptAt: null,
+        });
+        await this.writeRejected(currentPorts, transaction, transaction.id, now);
+        return true;
+      }
+
+      if (transaction.requiresReference() && reference !== undefined) {
+        const prior = await currentPorts.wagers.findProcessedReversal(reference.id);
+        if (prior !== undefined) {
+          transaction.reject(FailureCode.ReferenceAlreadyReversed, now);
+          await currentPorts.wagers.updateDecision({
+            transaction,
+            snapshot: wallet.balance,
+            walletVersion: wallet.version,
+            attempts,
+            nextAttemptAt: null,
+          });
+          await this.writeRejected(currentPorts, transaction, transaction.id, now);
+          return true;
+        }
+      }
+
+      if (transaction.kind === WagerTransactionKind.Loss) {
+        transaction.markProcessed(reference?.id, now);
+        await currentPorts.wagers.updateDecision({
+          transaction,
+          snapshot: wallet.balance,
+          walletVersion: wallet.version,
+          attempts,
+          nextAttemptAt: null,
+        });
+        await currentPorts.outbox.append(WagerTransactionProcessed.from(
+          this.ids.next(),
+          transaction,
+          { correlationId: transaction.id, causationId: transaction.id },
+        ));
+        return true;
+      }
+
+      const direction = transaction.ledgerDirectionFor(reference);
+      let movement;
+      try {
+        movement = direction === "DEBIT"
+          ? wallet.debit({
+            entryId: this.ids.next(),
+            transactionId: transaction.id,
+            amount: transaction.money,
+            now,
+          })
+          : wallet.credit({
+            entryId: this.ids.next(),
+            transactionId: transaction.id,
+            amount: transaction.money,
+            now,
+          });
+      } catch (error) {
+        if (!(error instanceof Error) || error.name !== "InsufficientFundsError") throw error;
+        transaction.reject(
+          transaction.kind === WagerTransactionKind.Rollback
+            ? FailureCode.ReversalInsufficientFunds
+            : FailureCode.InsufficientFunds,
+          now,
+        );
+        await currentPorts.wagers.updateDecision({
+          transaction,
+          snapshot: wallet.balance,
+          walletVersion: wallet.version,
+          attempts,
+          nextAttemptAt: null,
+        });
+        await this.writeRejected(currentPorts, transaction, transaction.id, now);
+        return true;
+      }
+
+      await currentPorts.ledger.insert(movement.entry);
+      await currentPorts.wallets.update(wallet);
+      transaction.markProcessed(reference?.id, now);
+      await currentPorts.wagers.updateDecision({
+        transaction,
+        snapshot: wallet.balance,
+        walletVersion: wallet.version,
+        attempts,
+        nextAttemptAt: null,
+      });
+      await this.writeProcessed(
+        currentPorts,
+        transaction,
+        movement.entry,
+        wallet,
+        transaction.id,
+        now,
+      );
+      return true;
+    });
+  }
+
+  private async run(input: ProcessWagerInput): Promise<WagerResult> {
+    const money = Money.from(input.money);
+    const hash = payloadHash(input);
+    const now = this.clock.now();
+    return this.runner.run(async (sql) => this.processTransaction(
+      input,
+      money,
+      hash,
+      now,
+      this.ports.forTransaction(sql),
+    ));
+  }
+
+  private async processTransaction(
+    input: ProcessWagerInput,
+    money: Money,
+    hash: string,
+    now: Date,
+    currentPorts: WageringPorts,
+  ): Promise<WagerResult> {
       const existingWallet = await currentPorts.wallets.findById(input.walletId, false);
       if (existingWallet === undefined) {
         return this.result(
@@ -276,7 +528,6 @@ export class ProcessWagerTransactionUseCase {
       });
       await this.writeProcessed(currentPorts, transaction, movement.entry, wallet, input.correlationId, now);
       return this.result(transaction.id, transaction.status, wallet.id, wallet.balance, wallet.version, false);
-    });
   }
 
   private async writeRejected(

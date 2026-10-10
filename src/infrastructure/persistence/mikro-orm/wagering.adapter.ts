@@ -8,8 +8,10 @@ import {
 import { Wallet } from "../../../domain/wallet/wallet";
 import {
   LedgerRepositoryPort,
+  LockedPendingReference,
   NewWagerRecord,
   OutboxWriterPort,
+  PendingReferenceCandidate,
   WagerRepositoryPort,
   WalletRepositoryPort,
   WageringPortFactory,
@@ -17,6 +19,11 @@ import {
 } from "../../../application/ports/wagering.ports";
 import { SqlTransaction } from "../../../application/ports/transaction-runner.port";
 import { IntegrationEvent } from "../../../domain/events";
+import {
+  InboxMessageRecord,
+  InboxPayloadMismatchError,
+  InboxRepositoryPort,
+} from "../../../application/ports/inbox-message.port";
 
 type Row = Record<string, unknown>;
 
@@ -135,6 +142,37 @@ class MikroWagerRepository implements WagerRepositoryPort {
     return this.findOne("id = $1", [id]);
   }
 
+  async findNextPendingReference(now: Date): Promise<PendingReferenceCandidate | undefined> {
+    const rows = await this.sql.execute<{ id: string; walletId: string }>(
+      `select id, wallet_id as "walletId"
+         from wager_transactions
+        where status = 'PENDING_REFERENCE' and next_attempt_at <= $1
+        order by next_attempt_at, created_at, id
+        limit 1`,
+      [now],
+    );
+    return rows[0];
+  }
+
+  async findPendingReferenceForUpdate(
+    id: string,
+    now: Date,
+  ): Promise<LockedPendingReference | undefined> {
+    const rows = await this.sql.execute(
+      `select * from wager_transactions
+        where id = $1 and status = 'PENDING_REFERENCE'
+          and next_attempt_at <= $2
+        for update`,
+      [id, now],
+    );
+    const row = rows[0];
+    if (row === undefined) return undefined;
+    return {
+      transaction: wager(row),
+      attempts: Number(row.attempts),
+    };
+  }
+
   async findReferenceForUpdate(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined> {
     return this.findOne(
       "provider_id = $1 and external_transaction_id = $2",
@@ -205,6 +243,46 @@ class MikroLedgerRepository implements LedgerRepositoryPort {
   }
 }
 
+class MikroInboxRepository implements InboxRepositoryPort {
+  constructor(private readonly sql: SqlTransaction) {}
+
+  async insertIfAbsent(record: InboxMessageRecord): Promise<boolean> {
+    const inserted = await this.sql.execute<{ message_id: string }>(
+      `insert into inbox_messages (consumer_name, message_id, payload_hash, received_at)
+       values ($1, $2, $3, $4)
+       on conflict (consumer_name, message_id) do nothing
+       returning message_id`,
+      [record.consumerName, record.messageId, record.payloadHash, record.receivedAt],
+    );
+    if (inserted.length > 0) return true;
+
+    const existing = await this.sql.execute<{ payload_hash: string }>(
+      `select payload_hash from inbox_messages
+       where consumer_name = $1 and message_id = $2`,
+      [record.consumerName, record.messageId],
+    );
+    if (existing[0] === undefined) {
+      throw new Error("inbox conflict disappeared before SELECT");
+    }
+    if (existing[0].payload_hash !== record.payloadHash) {
+      throw new InboxPayloadMismatchError();
+    }
+    return false;
+  }
+
+  async markProcessed(consumerName: string, messageId: string, processedAt: Date): Promise<void> {
+    const rows = await this.sql.execute<{ message_id: string }>(
+      `update inbox_messages set processed_at = $3
+       where consumer_name = $1 and message_id = $2 and processed_at is null
+       returning message_id`,
+      [consumerName, messageId, processedAt],
+    );
+    if (rows.length !== 1) {
+      throw new Error("inbox message could not be marked processed");
+    }
+  }
+}
+
 class MikroOutboxWriter implements OutboxWriterPort {
   constructor(private readonly sql: SqlTransaction) {}
 
@@ -231,6 +309,7 @@ export class MikroWageringPortFactory implements WageringPortFactory {
       wagers: new MikroWagerRepository(transaction),
       wallets: new MikroWalletRepository(transaction),
       ledger: new MikroLedgerRepository(transaction),
+      inbox: new MikroInboxRepository(transaction),
       outbox: new MikroOutboxWriter(transaction),
     };
   }

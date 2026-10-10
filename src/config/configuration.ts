@@ -13,6 +13,15 @@ export interface AppConfig {
   sqs: {
     endpoint: string;
     region: string;
+    wagerQueueName: string;
+    wagerDlqName: string;
+    eventQueueName: string;
+    maxReceiveCount: number;
+  };
+  pendingReferences: {
+    maxAttempts: number;
+    ttlSeconds: number;
+    pollIntervalMs: number;
   };
 }
 
@@ -52,6 +61,15 @@ export function loadConfig(): AppConfig {
     sqs: {
       endpoint: required("SQS_ENDPOINT", "http://127.0.0.1:4566"),
       region: required("AWS_REGION", "us-east-1"),
+      wagerQueueName: required("SQS_WAGER_QUEUE_NAME", "wager-transactions.fifo"),
+      wagerDlqName: required("SQS_WAGER_DLQ_NAME", "wager-transactions-dlq.fifo"),
+      eventQueueName: required("SQS_EVENT_QUEUE_NAME", "wager-events.fifo"),
+      maxReceiveCount: integer("SQS_MAX_RECEIVE_COUNT", "5"),
+    },
+    pendingReferences: {
+      maxAttempts: integer("PENDING_REFERENCE_MAX_ATTEMPTS", "5"),
+      ttlSeconds: integer("PENDING_REFERENCE_TTL_SECONDS", "86400"),
+      pollIntervalMs: integer("PENDING_REFERENCE_POLL_INTERVAL_MS", "1000"),
     },
   };
 }

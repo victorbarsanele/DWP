@@ -5,15 +5,21 @@ import {
   Headers,
   Param,
   Post,
+  Query,
   Res,
+  UseGuards,
 } from "@nestjs/common";
+import Decimal from "decimal.js";
 import { CreateWalletUseCase } from "../application/use-cases/create-wallet.use-case";
 import { RandomIdGenerator } from "../application/services/clock";
 import { ProcessWagerTransactionUseCase } from "../application/use-cases/process-wager-transaction.use-case";
+import { MetricsRegistry } from "../application/services/metrics.registry";
 import { FailureCode, FAILURE_METADATA } from "../domain/shared/failure-code";
 import { HttpQueryService } from "./query.service";
 import { HttpValidationError, validateCreateWalletBody, validateWagerBody } from "./validation";
 import { HttpFailure } from "./http-errors";
+import { LedgerCursor } from "./query.service";
+import { ProviderAuthGuard } from "./provider-auth.guard";
 
 type ResponseLike = {
   statusCode: number;
@@ -31,13 +37,45 @@ function failureStatus(code: FailureCode): number {
   return FAILURE_METADATA[code].httpStatus;
 }
 
+function dateString(value: unknown): string {
+  const date = value instanceof Date ? value : new Date(String(value));
+  if (!Number.isFinite(date.getTime())) throw new Error("database returned invalid ledger timestamp");
+  return date.toISOString();
+}
+
+function encodeLedgerCursor(cursor: { createdAt: string; id: string }): string {
+  return Buffer.from(JSON.stringify(cursor)).toString("base64url");
+}
+
+function decodeLedgerCursor(value: string): LedgerCursor {
+  if (value.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new HttpValidationError(["cursor"]);
+  }
+  try {
+    const decoded: unknown = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (typeof decoded !== "object" || decoded === null) throw new Error("invalid cursor");
+    const cursor = decoded as { createdAt?: unknown; id?: unknown };
+    const createdAt = new Date(String(cursor.createdAt));
+    if (
+      !Number.isFinite(createdAt.getTime())
+      || typeof cursor.id !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cursor.id)
+    ) throw new Error("invalid cursor");
+    return { createdAt, id: cursor.id };
+  } catch {
+    throw new HttpValidationError(["cursor"]);
+  }
+}
+
 @Controller()
+@UseGuards(ProviderAuthGuard)
 export class WalletController {
   constructor(
     private readonly createWallet: CreateWalletUseCase,
     private readonly processWager: ProcessWagerTransactionUseCase,
     private readonly ids: RandomIdGenerator,
     private readonly queries: HttpQueryService,
+    private readonly metrics: MetricsRegistry,
   ) {}
 
   private correlation(value: string | undefined, response: ResponseLike): string {
@@ -99,6 +137,60 @@ export class WalletController {
       playerId: String(row.player_id),
       balance: { amount: String(row.balance_amount), currency: String(row.currency) },
       version: Number(row.version),
+    };
+  }
+
+  @Get("wallets/:walletId/ledger")
+  async getLedger(
+    @Param("walletId") walletId: string,
+    @Query("limit") rawLimit: string | undefined,
+    @Query("cursor") rawCursor: string | undefined,
+  ) {
+    const wallet = await this.queries.wallet(walletId);
+    if (wallet === undefined) throw new HttpFailure(FailureCode.WalletNotFound, "Wallet not found");
+    const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new HttpValidationError(["limit"]);
+    }
+    const cursor = rawCursor === undefined ? undefined : decodeLedgerCursor(rawCursor);
+    const rows = await this.queries.ledgerPage(walletId, cursor, limit + 1);
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      entries: page.map((row) => ({
+        id: String(row.id),
+        transactionId: String(row.transaction_id),
+        direction: String(row.direction),
+        amount: { amount: String(row.amount), currency: String(row.currency) },
+        balanceBefore: String(row.balance_before),
+        balanceAfter: String(row.balance_after),
+        createdAt: dateString(row.created_at),
+      })),
+      nextCursor: hasMore && last !== undefined
+        ? encodeLedgerCursor({ createdAt: dateString(last.created_at), id: String(last.id) })
+        : undefined,
+    };
+  }
+
+  @Post("wallets/:walletId/reconciliation")
+  async reconcileWallet(@Param("walletId") walletId: string) {
+    const row = await this.queries.reconciliation(walletId);
+    if (row === undefined) throw new HttpFailure(FailureCode.WalletNotFound, "Wallet not found");
+    const storedBalance = new Decimal(String(row.stored_balance));
+    const calculatedBalance = new Decimal(String(row.calculated_balance));
+    const consistent = storedBalance.equals(calculatedBalance);
+    if (!consistent) {
+      this.metrics.increment("reconciliation_divergences_total");
+    }
+    return {
+      walletId: String(row.id),
+      currency: String(row.currency),
+      storedBalance: storedBalance.toFixed(2),
+      calculatedBalance: calculatedBalance.toFixed(2),
+      checkedEntries: Number(row.checked_entries),
+      consistent,
+      status: consistent ? "CONSISTENT" : "DIVERGED",
     };
   }
 

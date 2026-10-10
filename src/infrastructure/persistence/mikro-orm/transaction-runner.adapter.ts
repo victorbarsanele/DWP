@@ -5,6 +5,7 @@ import {
   SqlTransaction,
   TransactionRunnerPort,
 } from "../../../application/ports/transaction-runner.port";
+import { MetricsRegistry } from "../../../application/services/metrics.registry";
 
 export class MikroTransactionRunner implements TransactionRunnerPort {
   constructor(
@@ -13,6 +14,7 @@ export class MikroTransactionRunner implements TransactionRunnerPort {
     private readonly statementTimeoutMs = Number(process.env.DB_STATEMENT_TIMEOUT_MS ?? "10000"),
     private readonly maxAttempts = Number(process.env.DB_TRANSACTION_RETRIES ?? "3"),
     private readonly retryBackoffMs = Number(process.env.DB_TRANSACTION_RETRY_BACKOFF_MS ?? "10"),
+    private readonly metrics?: MetricsRegistry,
   ) {}
 
   async run<T>(work: (transaction: SqlTransaction) => Promise<T>): Promise<T> {
@@ -54,8 +56,13 @@ export class MikroTransactionRunner implements TransactionRunnerPort {
           return work(sql);
         });
       } catch (error) {
+        const code = (error as { code?: string })?.code;
+        if (code === "40P01" || code === "55P03") {
+          this.metrics?.increment("database_lock_conflicts_total");
+        }
         if (isTransientPostgresError(error)) {
           if (attempt < this.maxAttempts) {
+            this.metrics?.increment("retries_total");
             await new Promise((resolve) => setTimeout(resolve, this.retryBackoffMs * attempt));
             continue;
           }
