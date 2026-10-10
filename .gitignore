@@ -2,3 +2,6 @@ node_modules
 dist
 spike/bun.lockb
 spike/lock-output.txt
+.env
+test-results
+coverage
