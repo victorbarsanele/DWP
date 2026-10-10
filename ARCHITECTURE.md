@@ -99,8 +99,9 @@ constraint, deduplicação apenas em aplicação.
 **Trade-offs.** Mais uma constraint e caminho de erro, em troca de detectar
 colisões mesmo com múltiplas instâncias.
 
-**Evidência.** PENDENTE: constraint será coberta pela migration e integração
-PostgreSQL na etapa 3.
+**Evidência.** [schema-constraints.int.test.ts](./test/integration/postgres/schema-constraints.int.test.ts),
+`handles both idempotency collisions without aborting READ COMMITTED`, cobre
+ambas unicidades e colisões sem abortar transação.
 
 ### 2.4 Money com Decimal e `numeric(19,2)`
 
@@ -146,8 +147,10 @@ em cache, sobrescrever snapshot terminal.
 **Trade-offs.** Mais colunas e regra de imutabilidade; resposta determinística
 e auditável.
 
-**Evidência.** PENDENTE: teste será obrigatório após implementação; trigger ou
-constraint de imutabilidade do snapshot será avaliado na etapa 3.
+**Evidência.** [schema-constraints.int.test.ts](./test/integration/postgres/schema-constraints.int.test.ts),
+`enforces snapshot and failure/status coherence` e `allows pending resolution
+snapshot replacement and blocks other changes`, valida coerência, snapshot
+pendente, troca na resolução e imutabilidade.
 
 ### 2.6 Rejeição de negócio commitada
 
@@ -188,8 +191,11 @@ checagem apenas em código, permitir duas operações compensatórias.
 **Trade-offs.** Regra mais restritiva pode rejeitar sequência operacional que
 provedor esperava, mas evita crédito duplicado.
 
-**Evidência.** [Spike item 6](./spike/REPORT.md#6-migration-reversível-trigger-e-constraints)
-provou violação do índice parcial.
+**Evidência.** [schema-constraints.int.test.ts](./test/integration/postgres/schema-constraints.int.test.ts),
+`enforces one processed reversal while allowing rejected plus processed`, prova
+REJECTED + PROCESSED permitido e segundo PROCESSED bloqueado; [spike item
+6](./spike/REPORT.md#6-migration-reversível-trigger-e-constraints) cobre a
+validação inicial da migration.
 
 ### 2.8 WIN com referência opcional
 
@@ -407,6 +413,78 @@ fica explícita.
 
 **Evidência.** PENDENTE: guard e documentação de integração na etapa 6.
 
+### 2.19 Garantias adicionais do schema
+
+**Contexto.** Migration precisa bloquear mutações financeiras sem impedir
+resolução válida de pending.
+
+**Decisão.** UPDATE de wager com `OLD.status` terminal (`PROCESSED`,
+`REJECTED`, `FAILED`) lança SQLSTATE `55000`; DELETE de qualquer wager também.
+Snapshot definido em `PENDING_REFERENCE` não muda enquanto status continua
+`PENDING_REFERENCE`. Transição de pending para `PROCESSED`/`REJECTED`/`FAILED`
+pode gravar snapshot da resolução. Depois de terminal, wager e snapshot ficam
+imutáveis. Wager de reversão processada exige `reference_transaction_id`.
+`FAILED` pode não ter snapshot.
+
+`numeric(19,2)` arredonda silenciosamente entradas com mais de duas casas.
+`Money.from` rejeita escala inválida antes do SQL; banco não substitui
+validação de contrato.
+
+**Alternativas descartadas.** Permitir update terminal, CHECK de escala,
+bloquear resolução de pending, DELETE para limpeza operacional.
+
+**Trade-offs.** Trigger adiciona SQLSTATE/mensagens que adapters precisam
+mapear; validação de escala fica no domínio/boundary.
+
+**Evidência.** [schema-constraints.int.test.ts](./test/integration/postgres/schema-constraints.int.test.ts),
+`enforces snapshot and failure/status coherence`, `allows pending resolution
+snapshot replacement and blocks other changes`, `enforces one processed
+reversal while allowing rejected plus processed` e `blocks ledger update and
+delete with SQLSTATE 55000`; [migration-cycle.int.ts](./test/integration/postgres/migration-cycle.int.ts),
+`runs up, down, up and restores schema`.
+
+### 2.20 Colisões sem abortar transação
+
+**Contexto.** Unique violation aborta transação PostgreSQL.
+
+**Decisão.** Etapa futura usa `INSERT ... ON CONFLICT DO NOTHING RETURNING`
+sem alvo explícito. Colisões por `idempotency_key` e por
+`(provider_id, external_transaction_id)` retornam vazio e seguem com SELECT na
+mesma transação `READ COMMITTED`. Mensagem inválida não cria linha: consumer
+faz log estruturado, métrica, DLQ e ack para evitar loop.
+
+**Alternativas descartadas.** Capturar unique violation e continuar, cache,
+dedup somente SQS.
+
+**Trade-offs.** SQL raw pode ser necessário no MikroORM, mas mantém transação
+utilizável.
+
+**Evidência.** [schema-constraints.int.test.ts](./test/integration/postgres/schema-constraints.int.test.ts),
+`handles both idempotency collisions without aborting READ COMMITTED`; [spike
+item 5](./spike/REPORT.md#5-on-conflict-do-nothing-returning) validou comando
+e retorno concorrente.
+
+### 2.21 Identidade sintética de OPENING
+
+**Contexto.** Saldo inicial precisa ser auditável, mas OPENING não pode vir de
+API/fila.
+
+**Decisão.** Criação de wallet e crédito inicial ocorrem na mesma transação:
+`provider_id = 'internal'`, `external_transaction_id =
+'opening:<walletId>'`, `idempotency_key = 'internal:opening:<walletId>'`,
+`round_id = 'internal'`, `game_id = 'wallet-opening'`, `kind = 'OPENING'`,
+`status = 'PROCESSED'`. Wallet nasce com saldo inicial e `version = 1`;
+ledger registra `CREDIT`. OPENING externo retorna `400`.
+
+**Alternativas descartadas.** Saldo sem wager, ledger sem transação, OPENING
+recebido de provedor.
+
+**Trade-offs.** Criação ganha uma linha financeira, mantendo reconciliação
+completa desde origem.
+
+**Evidência.** PENDENTE: caso de criação de wallet e ledger OPENING pertencem à
+etapa de use case.
+
 ## 3. HTTP e failureCode
 
 ### 3.1 Corpo uniforme
@@ -476,8 +554,13 @@ infraestrutura, códigos completos de validação DTO e contrato de `FAILED`.
   SIGTERM após duas tentativas. Validar `beforeApplicationShutdown` no container
   Linux; consumidor deve concluir mensagem ou devolver visibilidade antes de
   encerrar.
-- **PENDENTE — item 8.** Teste único `bun test` ainda precisa cobrir DI Nest,
-  transação MikroORM com lock e ida/volta SQS real.
+- **Concluído — item 8 da Etapa 1.** `nest-lock.int.test.ts` valida DI
+  Nest, `EntityManager.fork()`, transação MikroORM, lock pessimista e SQL
+  `FOR UPDATE` sob `bun test`. Ida/volta SQS real permanece pendente na etapa
+  de mensageria.
+- **Linha 4 revisada.** Testes de migration usam banco separado via
+  `TEST_DATABASE_URL`; `bun test` normal não executa teardown `down`. Ciclo
+  destrutivo roda apenas em `test:migration`.
 - **PENDENTE — produção.** Use case, migrations definitivas, repositories,
   inbox/outbox, workers, observabilidade, reconciliação e API ainda não existem.
 - **PENDENTE — replay.** Testar snapshot congelado para PROCESSED, REJECTED e
@@ -489,6 +572,8 @@ infraestrutura, códigos completos de validação DTO e contrato de `FAILED`.
   silenciosamente.
 - **PENDENTE — outbox.** Testar publishers concorrentes, crash após publicação
   e dedup por `eventId`.
+- **PENDENTE — mensagem inválida.** Payload não parseável não gera linha:
+  log estruturado, métrica, DLQ e ack da mensagem original.
 - **PENDENTE — versões.** Upgrade para versões atuais só após spike específico;
   não misturar major upgrades com implementação financeira.
 - **Limitação conhecida.** `@mikro-orm/nestjs` publicado no spike foi 6.1.2,
